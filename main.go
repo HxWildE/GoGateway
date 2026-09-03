@@ -1,50 +1,91 @@
 package main
+
 import (
 	"fmt"
-	)
+	"log"
+	"net/http"
+	"net/url"
+	"time"
 
+	"letsgolang/backend"
+	"letsgolang/config"
+	"letsgolang/health"
+	"letsgolang/loadbalancer"
+	"letsgolang/proxy"
+	"letsgolang/server"
+)
 
-//format package
 func main() {
+	log.Println("[Main] Initializing Gateway and Backends...")
 
-	fmt.Println("Hello From Go!")
-	
-	// var a ,b int
-	var name string
+	// 1. Load configuration from flags
+	cfg := config.LoadConfig()
 
-	 var tasks tasklist
-	 tasks = writetask(tasks)
-     readtask(tasks)
+	// 2. Start simulated backends in concurrent goroutines
+	var simulatedServers []*backend.SimulatedBackend
+	for _, addr := range cfg.BackendAddrs {
+		sb := backend.NewSimulatedBackend(addr)
+		simulatedServers = append(simulatedServers, sb)
 
-	fmt.Println("Enter Creator hash : " ,name)
-	fmt.Scanln(&name)
-	fmt.Println("Enter Creator hash : " ,name)	
+		// Start backend in a background goroutine
+		go func(srv *backend.SimulatedBackend) {
+			if err := srv.Start(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("[Main] Simulated backend at %s failed: %v", srv.Addr, err)
+			}  
+		}(sb)
+	}
+	//If a err is thrown and its not http.ErrServerClosed (HEALHTY GRACEFUL EXIT ERR) ,log Fatal 
 
-	var a int = 0
-	var b int = 0
+	// Defer cleanup of simulated backends when main exits
+	defer func() {
+		log.Println("[Main] Cleaning up simulated backends...")
+		for _, srv := range simulatedServers {
+			_ = srv.Close()
+		}
+	}()
 
-	fmt.Println("Enter first number :")
-	fmt.Scanln(&a)
-	fmt.Println("Enter Second number : ")
-	fmt.Scanln(&b)
-	
-	fmt.Println(runAdd(a , b))
-	fmt.Println(runMod(a ,b))
-	fmt.Println(runMul(a , b))
-	
-	taskcreate()
+	// Give simulated backends a brief moment to start up before checking health
+	time.Sleep(500 * time.Millisecond)
 
+	// 3. Initialize Backend Pool
+	pool := loadbalancer.NewBackendPool()
+	for _, addr := range cfg.BackendAddrs {
+		backendURL, err := url.Parse(fmt.Sprintf("http://%s", addr))
+		if err != nil {
+			log.Fatalf("[Main] Invalid backend URL %s: %v", addr, err)
+		}
 
-	
-	// fmt.Println(runMod(a,b))
+		// Closure-based passive failure detection:
+		// We define the Backend pointer first so the error handler can close over it.
+		var b *loadbalancer.Backend
 
-	//runnig maths go lib func
-	//bcoz it also belongs ot main packg 
-	//so we can call it directly
+		proxyHandler := proxy.NewProxy(backendURL, cfg.ProxyTimeout, func(err error) {
+			if b != nil {
+				// Mark backend offline immediately upon request routing failure
+				b.SetAlive(false)
+			}
+		})
 
+		b = &loadbalancer.Backend{
+			URL:          backendURL,
+			Alive:        true, // Start by assuming healthy; health checker will verify
+			ReverseProxy: proxyHandler,
+		}
 
+		pool.AddBackend(b)
+	}
 
+	// 4. Create active background Health Checker
+	checker := health.NewHealthChecker(pool, cfg.HealthCheckInterval, cfg.HealthCheckTimeout)
+
+	// 5. Create reverse proxy Gateway HTTP Handler
+	gatewayHandler := proxy.NewGatewayHandler(pool)
+
+	// 6. Create and start Orchestrator Server
+	srv := server.NewGatewayServer(cfg.GatewayAddr, gatewayHandler, checker, 10*time.Second)
+
+	log.Printf("[Main] System initialized. Routing to: %v", cfg.BackendAddrs)
+	if err := srv.Start(); err != nil {
+		log.Fatalf("[Main] Gateway encountered critical error: %v", err)
+	}
 }
-
-
-//if you create a var , using it is important
