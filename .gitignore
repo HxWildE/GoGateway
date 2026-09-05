@@ -2,9 +2,7 @@ notes1.txt
 
 ./notes
 
-./docs
-docs
 .git_push_state.json
 auto_pusher.log
 auto_pusher.ps1
-
+*.exe

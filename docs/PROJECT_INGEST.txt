@@ -1,0 +1,2252 @@
+================================================================================
+  PROJECT INGEST — CONCURRENT HTTP REVERSE PROXY & LOAD BALANCER IN GO
+  Module: letsgolang | Go 1.26.5 | Zero External Dependencies
+  Generated: 2026-08-29
+================================================================================
+
+  This file contains the COMPLETE source code of the project in one place.
+  Use it to read, search, and review the entire codebase without jumping
+  between files. Every source file is included in dependency order.
+
+========================================================================================================================
+  PROJECT INGEST — CONCURRENT HTTP REVERSE PROXY & LOAD BALANCER IN GO
+  Module: letsgolang | Go 1.26.5 | Zero External Dependencies
+  Generated: 2026-08-29
+================================================================================
+
+  This file contains the COMPLETE source code of the project in one place.
+  Use it to read, search, and review the entire codebase without jumping
+  between files. Every source file is included in dependency order.
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  LINE     FILE                              ROLE
+  ────     ────                              ────
+  ~40      go.mod                            Module definition
+  ~50      config/config.go                  CLI flags & configuration
+  ~110     loadbalancer/roundrobin.go         Backend pool & round-robin
+  ~200     backend/backend.go                Simulated downstream servers
+  ~320     proxy/proxy.go                    Reverse proxy & gateway handler
+  ~430     health/checker.go                 Background health polling
+  ~580     server/server.go                  Listener socket & graceful shutdown
+  ~680     main.go                           Bootstrap orchestrator
+  ~790     tests/roundrobin_test.go          Selection & concurrency tests
+  ~930     tests/proxy_test.go               Header & failure tests
+  ~1050    tests/integration_test.go         End-to-end flow tests
+
+================================================================================
+  ARCHITECTURE DIAGRAM
+================================================================================
+
+                        CLIENT (curl / browser)
+                           │
+                           │ HTTP Request
+                           ▼
+                  ┌───────────────────┐
+                  │   GO GATEWAY      │
+                  │   :8080           │
+                  │                   │
+                  │  ┌─────────────┐  │
+                  │  │  server/    │  │  ← Listener + Shutdown
+                  │  └──────┬──────┘  │
+                  │         │         │
+                  │  ┌──────▼──────┐  │
+                  │  │  proxy/     │  │  ← ReverseProxy + Headers
+                  │  └──────┬──────┘  │
+                  │         │         │
+                  │  ┌──────▼──────┐  │
+                  │  │loadbalancer/│  │  ← Round Robin + Atomic Index
+                  │  └─────────────┘  │
+                  │                   │
+                  │  ┌─────────────┐  │
+                  │  │  health/    │  │  ← Background Polling (parallel)
+                  │  └─────────────┘  │
+                  └────────┬──────────┘
+                           │
+                ┌──────────┴──────────┐
+                ▼                     ▼
+          BACKEND A (:8081)     BACKEND B (:8082)
+
+================================================================================
+  FILE: go.mod
+================================================================================
+
+module letsgolang
+
+go 1.26.5
+
+================================================================================
+  FILE: config/config.go
+  ROLE: Parses command-line flags into a Config struct.
+  STRUCTS: Config
+  KEY DECISIONS: Using flags (not JSON/YAML) to keep deps at zero.
+================================================================================
+
+package config
+
+import (
+	"flag"
+	"strings"
+	"time"
+)
+
+// Config holds the configuration settings for the load balancer gateway and backend simulation.
+type Config struct {
+	GatewayAddr         string        // Address the gateway server listens on (e.g., ":8080")
+	BackendAddrs        []string      // List of downstream backend server addresses (e.g., "127.0.0.1:8081")
+	HealthCheckInterval time.Duration // Interval between periodic health checks
+	HealthCheckTimeout  time.Duration // Network timeout for health check requests
+	ProxyTimeout        time.Duration // Network timeout for reverse proxy client request forwarding
+}
+
+// LoadConfig parses command line flags and returns a populated Config struct.
+func LoadConfig() *Config {
+	gatewayAddr := flag.String("gateway", ":8080", "Address the reverse proxy gateway listens on")
+	backendsStr := flag.String("backends", "127.0.0.1:8081,127.0.0.1:8082", "Comma-separated list of backend addresses")
+	hcInterval := flag.Duration("health-interval", 5*time.Second, "Interval between backend health checks")
+	hcTimeout := flag.Duration("health-timeout", 2*time.Second, "Timeout for health check requests")
+	proxyTimeout := flag.Duration("proxy-timeout", 10*time.Second, "Timeout for reverse proxy client request forwarding")
+
+	flag.Parse()
+
+	// Parse comma-separated backend addresses into a slice
+	var backendAddrs []string
+	for _, addr := range strings.Split(*backendsStr, ",") {
+		addr = strings.TrimSpace(addr)
+		if addr != "" {
+			backendAddrs = append(backendAddrs, addr)
+		}
+	}
+
+	return &Config{
+		GatewayAddr:         *gatewayAddr,
+		BackendAddrs:        backendAddrs,
+		HealthCheckInterval: *hcInterval,
+		HealthCheckTimeout:  *hcTimeout,
+		ProxyTimeout:        *proxyTimeout,
+	}
+}
+
+================================================================================
+  FILE: loadbalancer/roundrobin.go
+  ROLE: Core data structures — Backend, BackendPool, round-robin selection.
+  STRUCTS: Backend, BackendPool
+  CONCURRENCY: sync.RWMutex on Backend.Alive, sync/atomic on BackendPool.current
+  KEY INSIGHT: This is a LEAF PACKAGE. It imports nothing from this project.
+================================================================================
+
+package loadbalancer
+
+import (
+	"net/http/httputil"
+	"net/url"
+	"sync"
+	"sync/atomic"
+)
+
+// Backend represents a single downstream backend server.
+type Backend struct {
+	URL          *url.URL
+	Alive        bool
+	ReverseProxy *httputil.ReverseProxy
+	mu           sync.RWMutex // Protects the Alive field
+}
+
+// SetAlive thread-safely updates the health state of the backend.
+func (b *Backend) SetAlive(alive bool) {
+	b.mu.Lock()
+	b.Alive = alive
+	b.mu.Unlock()
+}
+
+// IsAlive thread-safely checks if the backend is currently marked healthy.
+func (b *Backend) IsAlive() bool {
+	b.mu.RLock()
+	alive := b.Alive
+	b.mu.RUnlock()
+	return alive
+}
+
+// BackendPool orchestrates a set of backend instances and routes traffic among them.
+type BackendPool struct {
+	backends []*Backend
+	current  uint64 // Index used for the round-robin selection (accessed atomically)
+}
+
+// NewBackendPool initializes a new pool of backends.
+func NewBackendPool() *BackendPool {
+	return &BackendPool{
+		backends: make([]*Backend, 0),
+		current:  0,
+	}
+}
+
+// AddBackend registers a new backend server into the pool.
+func (bp *BackendPool) AddBackend(b *Backend) {
+	bp.backends = append(bp.backends, b)
+}
+
+// GetBackends returns all registered backend instances in the pool.
+func (bp *BackendPool) GetBackends() []*Backend {
+	return bp.backends
+}
+
+// NextBackend performs a thread-safe, atomic Round-Robin search to select the next healthy backend.
+// It loops through all backends at most once. If all backends are unhealthy, it returns nil.
+func (bp *BackendPool) NextBackend() *Backend {
+	n := uint64(len(bp.backends))
+	if n == 0 {
+		return nil
+	}
+
+	// Increment the counter atomically to avoid race conditions.
+	// The return value is a strictly increasing index.
+	next := atomic.AddUint64(&bp.current, 1)
+
+	// Search up to n times to find the first healthy backend starting from our round-robin index.
+	for i := uint64(0); i < n; i++ {
+		idx := (next + i) % n
+		candidate := bp.backends[idx]
+		if candidate.IsAlive() {
+			return candidate
+		}
+	}
+
+	return nil
+}
+
+================================================================================
+  FILE: backend/backend.go
+  ROLE: Simulated downstream HTTP backend servers for local testing.
+  STRUCTS: SimulatedBackend
+  ENDPOINTS: / (main handler), /health (health check), /toggle (simulate failure)
+  CONCURRENCY: sync.RWMutex on SimulatedBackend.healthy
+================================================================================
+
+package backend
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+)
+
+// SimulatedBackend simulates a downstream backend server with dynamic health toggling.
+type SimulatedBackend struct {
+	Addr    string
+	healthy bool
+	mu      sync.RWMutex
+	server  *http.Server
+}
+
+// NewSimulatedBackend creates a new backend instance.
+func NewSimulatedBackend(addr string) *SimulatedBackend {
+	return &SimulatedBackend{
+		Addr:    addr,
+		healthy: true,
+	}
+}
+
+// Start runs the HTTP server in a blocking call. It should be executed in a goroutine.
+func (sb *SimulatedBackend) Start() error {
+	mux := http.NewServeMux()
+
+	// Main request routing
+	mux.HandleFunc("/", sb.handleRequest)
+	// Health endpoint queried by the Gateway Health Checker
+	mux.HandleFunc("/health", sb.handleHealth)
+	// Endpoint to manually simulate failure/recovery for interview demos
+	mux.HandleFunc("/toggle", sb.handleToggle)
+
+	sb.server = &http.Server{
+		Addr:    sb.Addr,
+		Handler: mux,
+	}
+
+	log.Printf("[Backend %s] Starting simulated backend...", sb.Addr)
+	return sb.server.ListenAndServe()
+}
+
+// Close stops the HTTP server.
+func (sb *SimulatedBackend) Close() error {
+	if sb.server != nil {
+		return sb.server.Close()
+	}
+	return nil
+}
+
+// handleRequest processes incoming proxied HTTP traffic.
+func (sb *SimulatedBackend) handleRequest(w http.ResponseWriter, r *http.Request) {
+	sb.mu.RLock()
+	isHealthy := sb.healthy
+	sb.mu.RUnlock()
+
+	if !isHealthy {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Backend %s is UNHEALTHY (Simulated Failure)\n", sb.Addr)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Hello from backend server running at %s! Request Path: %s\n", sb.Addr, r.URL.Path)
+}
+
+// handleHealth reports health status to the health checker.
+func (sb *SimulatedBackend) handleHealth(w http.ResponseWriter, r *http.Request) {
+	sb.mu.RLock()
+	isHealthy := sb.healthy
+	sb.mu.RUnlock()
+
+	if isHealthy {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+	} else {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "FAIL")
+	}
+}
+
+// handleToggle allows manual simulation of failures via curl/browser.
+func (sb *SimulatedBackend) handleToggle(w http.ResponseWriter, r *http.Request) {
+	sb.mu.Lock()
+	sb.healthy = !sb.healthy
+	currentStatus := sb.healthy
+	sb.mu.Unlock()
+
+	statusStr := "HEALTHY"
+	if !currentStatus {
+		statusStr = "UNHEALTHY"
+	}
+
+	log.Printf("[Backend %s] Health manually toggled to: %s", sb.Addr, statusStr)
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Backend %s status toggled to %s\n", sb.Addr, statusStr)
+}
+
+================================================================================
+  FILE: proxy/proxy.go
+  ROLE: Wraps httputil.ReverseProxy with custom transport, headers, error handler.
+  STRUCTS: GatewayHandler
+  FUNCTIONS: NewProxy (creates configured reverse proxy), NewGatewayHandler
+  INTERFACE: GatewayHandler implements http.Handler (ServeHTTP)
+  CONCURRENCY: Passive failure callback closes over *Backend pointer
+================================================================================
+
+package proxy
+
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"time"
+
+	"letsgolang/loadbalancer"
+)
+
+// NewProxy creates a configured ReverseProxy instance for a specific backend URL.
+// It uses a custom transport to set timeouts and an ErrorHandler to trigger passive failure detection.
+func NewProxy(target *url.URL, timeout time.Duration, onFailure func(error)) *httputil.ReverseProxy {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	// Configure a dedicated Transport layer with timeouts to manage connection pooling.
+	proxy.Transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   timeout,         // Time limit to establish a TCP connection
+			KeepAlive: 30 * time.Second, // Keep-alive probe interval
+		}).DialContext,
+		MaxIdleConns:          100,               // Max idle connections across all hosts
+		IdleConnTimeout:       90 * time.Second,  // Keep idle connections open for 90s
+		TLSHandshakeTimeout:   10 * time.Second,  // Max time allowed for TLS handshakes
+		ExpectContinueTimeout: 1 * time.Second,   // Wait time for 100-continue header response
+	}
+
+	// Customize the Request Director to modify request headers before forwarding.
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+
+		// 1. Set X-Forwarded-Host to preserve client's original HTTP Host header
+		if req.Header.Get("X-Forwarded-Host") == "" {
+			req.Header.Set("X-Forwarded-Host", req.Host)
+		}
+
+		// 2. Set X-Forwarded-Proto to track original client protocol schema (HTTP or HTTPS)
+		if req.TLS != nil {
+			req.Header.Set("X-Forwarded-Proto", "https")
+		} else {
+			req.Header.Set("X-Forwarded-Proto", "http")
+		}
+	}
+
+	// Define a custom ErrorHandler. If the proxy fails to reach the backend,
+	// it triggers passive failure detection, marking the backend offline immediately.
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("[Proxy] Error routing request to %s: %v. Marking backend offline.", target.String(), err)
+		onFailure(err)
+
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, "Bad Gateway: Failed to connect to downstream backend server.\n")
+	}
+
+	return proxy
+}
+
+// GatewayHandler coordinates incoming client traffic to the appropriate backend using the load balancer.
+type GatewayHandler struct {
+	Pool *loadbalancer.BackendPool
+}
+
+// NewGatewayHandler creates a new reverse proxy gateway routing handler.
+func NewGatewayHandler(pool *loadbalancer.BackendPool) *GatewayHandler {
+	return &GatewayHandler{
+		Pool: pool,
+	}
+}
+
+// ServeHTTP implements the http.Handler interface to route requests.
+func (gh *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Exclude favicon requests from logging and proxying
+	if r.URL.Path == "/favicon.ico" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// 1. Select the next healthy backend from the pool
+	targetBackend := gh.Pool.NextBackend()
+	if targetBackend == nil {
+		log.Printf("[Gateway] Request FAILED: No healthy backends available in the pool for path %q", r.URL.Path)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, "Service Unavailable: No healthy backend servers are currently active in the pool.\n")
+		return
+	}
+
+	log.Printf("[Gateway] Routing client %s -> backend %s (%s)", r.RemoteAddr, targetBackend.URL.Host, r.URL.Path)
+
+	// 2. Delegate execution to the backend's ReverseProxy handler
+	targetBackend.ReverseProxy.ServeHTTP(w, r)
+}
+
+================================================================================
+  FILE: health/checker.go
+  ROLE: Active background health checker — polls /health on each backend.
+  STRUCTS: HealthChecker
+  CONCURRENCY: Background goroutine with time.Ticker, parallel sub-goroutines
+               for pinging each backend, sync.WaitGroup for coordination,
+               stopChan for graceful termination.
+================================================================================
+
+package health
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"letsgolang/loadbalancer"
+)
+
+// HealthChecker handles active background polling of downstream backends.
+type HealthChecker struct {
+	pool      *loadbalancer.BackendPool
+	interval  time.Duration
+	timeout   time.Duration
+	client    *http.Client
+	stopChan  chan struct{}
+	wg        sync.WaitGroup
+	runningMu sync.Mutex
+	running   bool
+}
+
+// NewHealthChecker creates a new HealthChecker.
+func NewHealthChecker(pool *loadbalancer.BackendPool, interval, timeout time.Duration) *HealthChecker {
+	return &HealthChecker{
+		pool:     pool,
+		interval: interval,
+		timeout:  timeout,
+		client: &http.Client{
+			Timeout: timeout,
+		},
+		stopChan: make(chan struct{}),
+	}
+}
+
+// Start spawns the background polling loop.
+func (hc *HealthChecker) Start() {
+	hc.runningMu.Lock()
+	if hc.running {
+		hc.runningMu.Unlock()
+		return
+	}
+	hc.running = true
+	hc.runningMu.Unlock()
+
+	hc.wg.Add(1)
+	go func() {
+		defer hc.wg.Done()
+		ticker := time.NewTicker(hc.interval)
+		defer ticker.Stop()
+
+		// Run an initial health check immediately on startup
+		hc.checkAll()
+
+		for {
+			select {
+			case <-ticker.C:
+				hc.checkAll()
+			case <-hc.stopChan:
+				log.Println("[HealthChecker] Stopping active background checks...")
+				return
+			}
+		}
+	}()
+}
+
+// Stop gracefully shuts down the health checking ticker and waits for any active queries to exit.
+func (hc *HealthChecker) Stop() {
+	hc.runningMu.Lock()
+	if !hc.running {
+		hc.runningMu.Unlock()
+		return
+	}
+	hc.running = false
+	close(hc.stopChan)
+	hc.runningMu.Unlock()
+
+	hc.wg.Wait()
+	log.Println("[HealthChecker] Stopped successfully.")
+}
+
+// checkAll queries every backend registered in the pool concurrently.
+func (hc *HealthChecker) checkAll() {
+	backends := hc.pool.GetBackends()
+	var checkWg sync.WaitGroup
+
+	for _, b := range backends {
+		checkWg.Add(1)
+		go func(backend *loadbalancer.Backend) {
+			defer checkWg.Done()
+			hc.checkBackend(backend)
+		}(b)
+	}
+
+	checkWg.Wait()
+}
+
+// checkBackend sends an HTTP health request to a specific backend's health endpoint.
+func (hc *HealthChecker) checkBackend(b *loadbalancer.Backend) {
+	healthURL := *b.URL
+	healthURL.Path = "/health"
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET", healthURL.String(), nil)
+	if err != nil {
+		log.Printf("[HealthChecker] Failed to create request for %s: %v", b.URL.Host, err)
+		b.SetAlive(false)
+		return
+	}
+
+	resp, err := hc.client.Do(req)
+	if err != nil {
+		// Log the transition from alive to dead to avoid log spam, but here we can just log failures
+		wasAlive := b.IsAlive()
+		b.SetAlive(false)
+		if wasAlive {
+			log.Printf("[HealthChecker] Backend %s went OFFLINE (Error: %v)", b.URL.Host, err)
+		}
+		return
+	}
+	defer resp.Body.Close()
+
+	isHealthy := resp.StatusCode == http.StatusOK
+	wasAlive := b.IsAlive()
+	b.SetAlive(isHealthy)
+
+	if isHealthy && !wasAlive {
+		log.Printf("[HealthChecker] Backend %s went ONLINE (Successfully recovered)", b.URL.Host)
+	} else if !isHealthy && wasAlive {
+		log.Printf("[HealthChecker] Backend %s went OFFLINE (HTTP status: %d)", b.URL.Host, resp.StatusCode)
+	}
+}
+
+================================================================================
+  FILE: server/server.go
+  ROLE: HTTP listener socket lifecycle and graceful shutdown orchestration.
+  STRUCTS: GatewayServer
+  CONCURRENCY: Goroutine for ListenAndServe, signal channel for OS interrupts,
+               context.WithTimeout for bounded shutdown draining.
+================================================================================
+
+package server
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"letsgolang/health"
+)
+
+// GatewayServer manages the lifecycle of the load-balanced reverse proxy gateway.
+type GatewayServer struct {
+	httpServer      *http.Server
+	checker         *health.HealthChecker
+	shutdownTimeout time.Duration
+}
+
+// NewGatewayServer initializes a new gateway server instance.
+func NewGatewayServer(addr string, handler http.Handler, checker *health.HealthChecker, shutdownTimeout time.Duration) *GatewayServer {
+	return &GatewayServer{
+		httpServer: &http.Server{
+			Addr:    addr,
+			Handler: handler,
+		},
+		checker:         checker,
+		shutdownTimeout: shutdownTimeout,
+	}
+}
+
+// Start launches the server, starts health checks, and blocks waiting for OS signals to shutdown gracefully.
+func (gs *GatewayServer) Start() error {
+	// 1. Start the active background health checker
+	gs.checker.Start()
+
+	// 2. Setup channel to receive HTTP server execution errors (e.g., port already bound)
+	serverErrors := make(chan error, 1)
+
+	// 3. Start listening for incoming client connections concurrently
+	go func() {
+		log.Printf("[GatewayServer] Gateway listening on %s", gs.httpServer.Addr)
+		if err := gs.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrors <- err
+		}
+	}()
+
+	// 4. Register signal handler channel for OS termination signals (SIGINT, SIGTERM)
+	shutdownSignal := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignal, os.Interrupt, syscall.SIGTERM)
+
+	// 5. Block until either the server crashes or we receive an interrupt signal
+	select {
+	case err := <-serverErrors:
+		return err
+	case sig := <-shutdownSignal:
+		log.Printf("[GatewayServer] Shutdown signal (%v) received. Initiating graceful shutdown...", sig)
+
+		// Create a bounded context to enforce a maximum wait time for active connection draining
+		ctx, cancel := context.WithTimeout(context.Background(), gs.shutdownTimeout)
+		defer cancel()
+
+		// Stop the background health checking ticker to prevent goroutine leaks
+		gs.checker.Stop()
+
+		// Gracefully drain all active HTTP requests. New requests will be rejected immediately,
+		// but existing client connections are given until the context expires to complete.
+		if err := gs.httpServer.Shutdown(ctx); err != nil {
+			log.Printf("[GatewayServer] Graceful shutdown failed: %v. Forcing immediate close.", err)
+			_ = gs.httpServer.Close()
+			return err
+		}
+
+		log.Println("[GatewayServer] Server stopped gracefully.")
+		return nil
+	}
+}
+
+================================================================================
+  FILE: main.go
+  ROLE: Entry point. Bootstraps backends, pool, proxies, health checker, server.
+  GOROUTINES SPAWNED: One per simulated backend server.
+  KEY PATTERN: Closure-based passive failure detection (line 61-66).
+================================================================================
+
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+	"time"
+
+	"letsgolang/backend"
+	"letsgolang/config"
+	"letsgolang/health"
+	"letsgolang/loadbalancer"
+	"letsgolang/proxy"
+	"letsgolang/server"
+)
+
+func main() {
+	log.Println("[Main] Initializing Gateway and Backends...")
+
+	// 1. Load configuration from flags
+	cfg := config.LoadConfig()
+
+	// 2. Start simulated backends in concurrent goroutines
+	var simulatedServers []*backend.SimulatedBackend
+	for _, addr := range cfg.BackendAddrs {
+		sb := backend.NewSimulatedBackend(addr)
+		simulatedServers = append(simulatedServers, sb)
+
+		// Start backend in a background goroutine
+		go func(srv *backend.SimulatedBackend) {
+			if err := srv.Start(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("[Main] Simulated backend at %s failed: %v", srv.Addr, err)
+			}
+		}(sb)
+	}
+
+	// Defer cleanup of simulated backends when main exits
+	defer func() {
+		log.Println("[Main] Cleaning up simulated backends...")
+		for _, srv := range simulatedServers {
+			_ = srv.Close()
+		}
+	}()
+
+	// Give simulated backends a brief moment to start up before checking health
+	time.Sleep(500 * time.Millisecond)
+
+	// 3. Initialize Backend Pool
+	pool := loadbalancer.NewBackendPool()
+	for _, addr := range cfg.BackendAddrs {
+		backendURL, err := url.Parse(fmt.Sprintf("http://%s", addr))
+		if err != nil {
+			log.Fatalf("[Main] Invalid backend URL %s: %v", addr, err)
+		}
+
+		// Closure-based passive failure detection:
+		// We define the Backend pointer first so the error handler can close over it.
+		var b *loadbalancer.Backend
+
+		proxyHandler := proxy.NewProxy(backendURL, cfg.ProxyTimeout, func(err error) {
+			if b != nil {
+				// Mark backend offline immediately upon request routing failure
+				b.SetAlive(false)
+			}
+		})
+
+		b = &loadbalancer.Backend{
+			URL:          backendURL,
+			Alive:        true, // Start by assuming healthy; health checker will verify
+			ReverseProxy: proxyHandler,
+		}
+
+		pool.AddBackend(b)
+	}
+
+	// 4. Create active background Health Checker
+	checker := health.NewHealthChecker(pool, cfg.HealthCheckInterval, cfg.HealthCheckTimeout)
+
+	// 5. Create reverse proxy Gateway HTTP Handler
+	gatewayHandler := proxy.NewGatewayHandler(pool)
+
+	// 6. Create and start Orchestrator Server
+	srv := server.NewGatewayServer(cfg.GatewayAddr, gatewayHandler, checker, 10*time.Second)
+
+	log.Printf("[Main] System initialized. Routing to: %v", cfg.BackendAddrs)
+	if err := srv.Start(); err != nil {
+		log.Fatalf("[Main] Gateway encountered critical error: %v", err)
+	}
+}
+
+================================================================================
+  FILE: tests/roundrobin_test.go
+  ROLE: Unit tests for selection distribution, unhealthy exclusion, concurrency.
+  RUN:  go test -v ./tests/ -run TestRoundRobin
+  RACE: go test -race ./tests/   (requires CGO_ENABLED=1)
+================================================================================
+
+package tests
+
+import (
+	"net/url"
+	"sync"
+	"testing"
+
+	"letsgolang/loadbalancer"
+)
+
+func TestRoundRobinSelection(t *testing.T) {
+	pool := loadbalancer.NewBackendPool()
+
+	urlA, _ := url.Parse("http://127.0.0.1:8081")
+	urlB, _ := url.Parse("http://127.0.0.1:8082")
+	urlC, _ := url.Parse("http://127.0.0.1:8083")
+
+	bA := &loadbalancer.Backend{URL: urlA, Alive: true}
+	bB := &loadbalancer.Backend{URL: urlB, Alive: true}
+	bC := &loadbalancer.Backend{URL: urlC, Alive: true}
+
+	pool.AddBackend(bA)
+	pool.AddBackend(bB)
+	pool.AddBackend(bC)
+
+	// Since current index is initialized to 0, atomic.AddUint64 sets it to 1.
+	// 1 % 3 = 1 -> bB
+	// 2 % 3 = 2 -> bC
+	// 3 % 3 = 0 -> bA
+	// Let's verify that successive calls return all three in order.
+	seen := make(map[string]int)
+	for i := 0; i < 6; i++ {
+		b := pool.NextBackend()
+		if b == nil {
+			t.Fatal("Expected backend, got nil")
+		}
+		seen[b.URL.Host]++
+	}
+
+	if seen["127.0.0.1:8081"] != 2 || seen["127.0.0.1:8082"] != 2 || seen["127.0.0.1:8083"] != 2 {
+		t.Errorf("Round Robin distribution incorrect. Seen map: %v", seen)
+	}
+}
+
+func TestUnhealthyBackendExclusion(t *testing.T) {
+	pool := loadbalancer.NewBackendPool()
+
+	urlA, _ := url.Parse("http://127.0.0.1:8081")
+	urlB, _ := url.Parse("http://127.0.0.1:8082")
+
+	bA := &loadbalancer.Backend{URL: urlA, Alive: true}
+	bB := &loadbalancer.Backend{URL: urlB, Alive: false} // Backend B is dead
+
+	pool.AddBackend(bA)
+	pool.AddBackend(bB)
+
+	// NextBackend should only return Backend A since B is dead
+	for i := 0; i < 5; i++ {
+		b := pool.NextBackend()
+		if b == nil {
+			t.Fatal("Expected active backend A, got nil")
+		}
+		if b.URL.Host != "127.0.0.1:8081" {
+			t.Errorf("Expected backend A, but got %s", b.URL.Host)
+		}
+	}
+
+	// Make Backend B alive and Backend A dead
+	bB.SetAlive(true)
+	bA.SetAlive(false)
+
+	// NextBackend should now only return Backend B
+	for i := 0; i < 5; i++ {
+		b := pool.NextBackend()
+		if b == nil {
+			t.Fatal("Expected active backend B, got nil")
+		}
+		if b.URL.Host != "127.0.0.1:8082" {
+			t.Errorf("Expected backend B, but got %s", b.URL.Host)
+		}
+	}
+
+	// Mark both dead
+	bB.SetAlive(false)
+	b := pool.NextBackend()
+	if b != nil {
+		t.Errorf("Expected nil when all backends are dead, got %s", b.URL.Host)
+	}
+}
+
+func TestConcurrentBackendSelection(t *testing.T) {
+	pool := loadbalancer.NewBackendPool()
+
+	urlA, _ := url.Parse("http://127.0.0.1:8081")
+	urlB, _ := url.Parse("http://127.0.0.1:8082")
+
+	bA := &loadbalancer.Backend{URL: urlA, Alive: true}
+	bB := &loadbalancer.Backend{URL: urlB, Alive: true}
+
+	pool.AddBackend(bA)
+	pool.AddBackend(bB)
+
+	var wg sync.WaitGroup
+	workers := 50
+	iterations := 1000
+
+	// Launch multiple goroutines selecting backends simultaneously to verify lack of races
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				b := pool.NextBackend()
+				if b == nil {
+					t.Error("Expected healthy backend, got nil")
+					return
+				}
+				// Simulate read access
+				_ = b.IsAlive()
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+================================================================================
+  FILE: tests/proxy_test.go
+  ROLE: Tests proxy header rewriting and passive failure callback triggering.
+  RUN:  go test -v ./tests/ -run TestProxy
+================================================================================
+
+package tests
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"letsgolang/proxy"
+)
+
+func TestProxyForwardingAndHeaders(t *testing.T) {
+	var receivedHeaders http.Header
+
+	// 1. Create a simulated backend server using httptest
+	backendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend success"))
+	}))
+	defer backendSrv.Close()
+
+	backendURL, err := url.Parse(backendSrv.URL)
+	if err != nil {
+		t.Fatalf("Failed to parse backend URL: %v", err)
+	}
+
+	// 2. Initialize our proxy handler pointing to this backend
+	var failedCount int64
+	proxyHandler := proxy.NewProxy(backendURL, 2*time.Second, func(err error) {
+		atomic.AddInt64(&failedCount, 1)
+	})
+
+	// 3. Create a test client request hitting our proxy handler
+	req := httptest.NewRequest("GET", "http://gateway.local/some-path", nil)
+	req.RemoteAddr = "192.168.1.100:54321"
+	req.Host = "gateway.local"
+
+	rec := httptest.NewRecorder()
+
+	// 4. Run the proxy handler
+	proxyHandler.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// 5. Verify the response and headers modified by proxy
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	if string(body) != "backend success" {
+		t.Errorf("Expected response body 'backend success', got %q", string(body))
+	}
+
+	// Check forwarded headers
+	forwardedFor := receivedHeaders.Get("X-Forwarded-For")
+	if forwardedFor != "192.168.1.100" {
+		t.Errorf("Expected X-Forwarded-For to be '192.168.1.100', got %q", forwardedFor)
+	}
+
+	forwardedHost := receivedHeaders.Get("X-Forwarded-Host")
+	if forwardedHost != "gateway.local" {
+		t.Errorf("Expected X-Forwarded-Host to be 'gateway.local', got %q", forwardedHost)
+	}
+
+	forwardedProto := receivedHeaders.Get("X-Forwarded-Proto")
+	if forwardedProto != "http" {
+		t.Errorf("Expected X-Forwarded-Proto to be 'http', got %q", forwardedProto)
+	}
+
+	if atomic.LoadInt64(&failedCount) != 0 {
+		t.Error("Failure callback was triggered unexpectedly")
+	}
+}
+
+func TestProxyPassiveFailureTrigger(t *testing.T) {
+	// 1. Create a simulated backend and close it immediately to force connection failure
+	backendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	backendURL, _ := url.Parse(backendSrv.URL)
+	backendSrv.Close() // Backend is offline now
+
+	// 2. Set up our proxy with a passive failure callback
+	var failedCount int64
+	proxyHandler := proxy.NewProxy(backendURL, 100*time.Millisecond, func(err error) {
+		atomic.AddInt64(&failedCount, 1)
+	})
+
+	// 3. Issue a request through proxy handler
+	req := httptest.NewRequest("GET", "http://gateway.local/path", nil)
+	rec := httptest.NewRecorder()
+	proxyHandler.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	// 4. Verify that we got a 502 Bad Gateway and the failure callback triggered
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("Expected status 502 Bad Gateway, got %d", resp.StatusCode)
+	}
+
+	if atomic.LoadInt64(&failedCount) != 1 {
+		t.Errorf("Expected failure callback count to be 1, got %d", atomic.LoadInt64(&failedCount))
+	}
+}
+
+================================================================================
+  FILE: tests/integration_test.go
+  ROLE: End-to-end test — round-robin routing, failover, and recovery.
+  RUN:  go test -v ./tests/ -run TestGatewayIntegration
+================================================================================
+
+package tests
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+	"time"
+
+	"letsgolang/loadbalancer"
+	"letsgolang/proxy"
+)
+
+func TestGatewayIntegration(t *testing.T) {
+	// 1. Start two test backend servers with distinct IDs
+	backendASrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-A"))
+	}))
+	defer backendASrv.Close()
+
+	backendBSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-B"))
+	}))
+	defer backendBSrv.Close()
+
+	urlA, _ := url.Parse(backendASrv.URL)
+	urlB, _ := url.Parse(backendBSrv.URL)
+
+	// 2. Initialize Backend Pool and proxies
+	pool := loadbalancer.NewBackendPool()
+
+	var bA, bB *loadbalancer.Backend
+
+	proxyA := proxy.NewProxy(urlA, time.Second, func(err error) {
+		if bA != nil {
+			bA.SetAlive(false)
+		}
+	})
+
+	proxyB := proxy.NewProxy(urlB, time.Second, func(err error) {
+		if bB != nil {
+			bB.SetAlive(false)
+		}
+	})
+
+	bA = &loadbalancer.Backend{URL: urlA, Alive: true, ReverseProxy: proxyA}
+	bB = &loadbalancer.Backend{URL: urlB, Alive: true, ReverseProxy: proxyB}
+
+	pool.AddBackend(bA)
+	pool.AddBackend(bB)
+
+	// 3. Setup Gateway Handler
+	gatewayHandler := proxy.NewGatewayHandler(pool)
+
+	// Helper function to query the gateway
+	queryGateway := func() string {
+		req := httptest.NewRequest("GET", "http://gateway.local/", nil)
+		rec := httptest.NewRecorder()
+		gatewayHandler.ServeHTTP(rec, req)
+		resp := rec.Result()
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return string(body)
+	}
+
+	// 4. Test normal round-robin (distribution among A and B)
+	// Since current starts at 0, atomic.Add sets it to 1 -> index 1 -> Backend B
+	// Next is index 2 -> 0 -> Backend A
+	firstResp := queryGateway()
+	secondResp := queryGateway()
+
+	if firstResp == secondResp {
+		t.Errorf("Expected different responses from successive requests, but got both %q", firstResp)
+	}
+
+	// Ensure both are represented
+	resps := map[string]bool{firstResp: true, secondResp: true}
+	if !resps["backend-A"] || !resps["backend-B"] {
+		t.Errorf("Expected to hit both backend-A and backend-B, but got: %v", resps)
+	}
+
+	// 5. Simulate Backend A going offline
+	bA.SetAlive(false)
+
+	// Query gateway 4 times; all responses must go to Backend B now
+	for i := 0; i < 4; i++ {
+		resp := queryGateway()
+		if resp != "backend-B" {
+			t.Errorf("Expected only backend-B while backend-A is dead, but got %q", resp)
+		}
+	}
+
+	// 6. Simulate Backend A recovery
+	bA.SetAlive(true)
+
+	// Query gateway 4 times; traffic should distribute between A and B again
+	responses := make(map[string]int)
+	for i := 0; i < 10; i++ {
+		responses[queryGateway()]++
+	}
+
+	if responses["backend-A"] == 0 || responses["backend-B"] == 0 {
+		t.Errorf("Expected traffic to resume routing to both after recovery, got distributions: %v", responses)
+	}
+}
+
+================================================================================
+  END OF PROJECT INGEST
+  Total source files: 10
+  Total lines of Go code: ~860 (excluding tests: ~550)
+  External dependencies: 0
+================================================================================
+========================================
+  TABLE OF CONTENTS
+================================================================================
+
+  LINE     FILE                              ROLE
+  ────     ────                              ────
+  ~40      go.mod                            Module definition
+  ~50      config/config.go                  CLI flags & configuration
+  ~110     loadbalancer/roundrobin.go         Backend pool & round-robin
+  ~200     backend/backend.go                Simulated downstream servers
+  ~320     proxy/proxy.go                    Reverse proxy & gateway handler
+  ~430     health/checker.go                 Background health polling
+  ~580     server/server.go                  Listener socket & graceful shutdown
+  ~680     main.go                           Bootstrap orchestrator
+  ~790     tests/roundrobin_test.go          Selection & concurrency tests
+  ~930     tests/proxy_test.go               Header & failure tests
+  ~1050    tests/integration_test.go         End-to-end flow tests
+
+================================================================================
+  ARCHITECTURE DIAGRAM
+================================================================================
+
+                        CLIENT (curl / browser)
+                           │
+                           │ HTTP Request
+                           ▼
+                  ┌───────────────────┐
+                  │   GO GATEWAY      │
+                  │   :8080           │
+                  │                   │
+                  │  ┌─────────────┐  │
+                  │  │  server/    │  │  ← Listener + Shutdown
+                  │  └──────┬──────┘  │
+                  │         │         │
+                  │  ┌──────▼──────┐  │
+                  │  │  proxy/     │  │  ← ReverseProxy + Headers
+                  │  └──────┬──────┘  │
+                  │         │         │
+                  │  ┌──────▼──────┐  │
+                  │  │loadbalancer/│  │  ← Round Robin + Atomic Index
+                  │  └─────────────┘  │
+                  │                   │
+                  │  ┌─────────────┐  │
+                  │  │  health/    │  │  ← Background Polling (parallel)
+                  │  └─────────────┘  │
+                  └────────┬──────────┘
+                           │
+                ┌──────────┴──────────┐
+                ▼                     ▼
+          BACKEND A (:8081)     BACKEND B (:8082)
+
+================================================================================
+  FILE: go.mod
+================================================================================
+
+module letsgolang
+
+go 1.26.5
+
+================================================================================
+  FILE: config/config.go
+  ROLE: Parses command-line flags into a Config struct.
+  STRUCTS: Config
+  KEY DECISIONS: Using flags (not JSON/YAML) to keep deps at zero.
+================================================================================
+
+package config
+
+import (
+	"flag"
+	"strings"
+	"time"
+)
+
+// Config holds the configuration settings for the load balancer gateway and backend simulation.
+type Config struct {
+	GatewayAddr         string        // Address the gateway server listens on (e.g., ":8080")
+	BackendAddrs        []string      // List of downstream backend server addresses (e.g., "127.0.0.1:8081")
+	HealthCheckInterval time.Duration // Interval between periodic health checks
+	HealthCheckTimeout  time.Duration // Network timeout for health check requests
+	ProxyTimeout        time.Duration // Network timeout for reverse proxy client request forwarding
+}
+
+// LoadConfig parses command line flags and returns a populated Config struct.
+func LoadConfig() *Config {
+	gatewayAddr := flag.String("gateway", ":8080", "Address the reverse proxy gateway listens on")
+	backendsStr := flag.String("backends", "127.0.0.1:8081,127.0.0.1:8082", "Comma-separated list of backend addresses")
+	hcInterval := flag.Duration("health-interval", 5*time.Second, "Interval between backend health checks")
+	hcTimeout := flag.Duration("health-timeout", 2*time.Second, "Timeout for health check requests")
+	proxyTimeout := flag.Duration("proxy-timeout", 10*time.Second, "Timeout for reverse proxy client request forwarding")
+
+	flag.Parse()
+
+	// Parse comma-separated backend addresses into a slice
+	var backendAddrs []string
+	for _, addr := range strings.Split(*backendsStr, ",") {
+		addr = strings.TrimSpace(addr)
+		if addr != "" {
+			backendAddrs = append(backendAddrs, addr)
+		}
+	}
+
+	return &Config{
+		GatewayAddr:         *gatewayAddr,
+		BackendAddrs:        backendAddrs,
+		HealthCheckInterval: *hcInterval,
+		HealthCheckTimeout:  *hcTimeout,
+		ProxyTimeout:        *proxyTimeout,
+	}
+}
+
+================================================================================
+  FILE: loadbalancer/roundrobin.go
+  ROLE: Core data structures — Backend, BackendPool, round-robin selection.
+  STRUCTS: Backend, BackendPool
+  CONCURRENCY: sync.RWMutex on Backend.Alive, sync/atomic on BackendPool.current
+  KEY INSIGHT: This is a LEAF PACKAGE. It imports nothing from this project.
+================================================================================
+
+package loadbalancer
+
+import (
+	"net/http/httputil"
+	"net/url"
+	"sync"
+	"sync/atomic"
+)
+
+// Backend represents a single downstream backend server.
+type Backend struct {
+	URL          *url.URL
+	Alive        bool
+	ReverseProxy *httputil.ReverseProxy
+	mu           sync.RWMutex // Protects the Alive field
+}
+
+// SetAlive thread-safely updates the health state of the backend.
+func (b *Backend) SetAlive(alive bool) {
+	b.mu.Lock()
+	b.Alive = alive
+	b.mu.Unlock()
+}
+
+// IsAlive thread-safely checks if the backend is currently marked healthy.
+func (b *Backend) IsAlive() bool {
+	b.mu.RLock()
+	alive := b.Alive
+	b.mu.RUnlock()
+	return alive
+}
+
+// BackendPool orchestrates a set of backend instances and routes traffic among them.
+type BackendPool struct {
+	backends []*Backend
+	current  uint64 // Index used for the round-robin selection (accessed atomically)
+}
+
+// NewBackendPool initializes a new pool of backends.
+func NewBackendPool() *BackendPool {
+	return &BackendPool{
+		backends: make([]*Backend, 0),
+		current:  0,
+	}
+}
+
+// AddBackend registers a new backend server into the pool.
+func (bp *BackendPool) AddBackend(b *Backend) {
+	bp.backends = append(bp.backends, b)
+}
+
+// GetBackends returns all registered backend instances in the pool.
+func (bp *BackendPool) GetBackends() []*Backend {
+	return bp.backends
+}
+
+// NextBackend performs a thread-safe, atomic Round-Robin search to select the next healthy backend.
+// It loops through all backends at most once. If all backends are unhealthy, it returns nil.
+func (bp *BackendPool) NextBackend() *Backend {
+	n := uint64(len(bp.backends))
+	if n == 0 {
+		return nil
+	}
+
+	// Increment the counter atomically to avoid race conditions.
+	// The return value is a strictly increasing index.
+	next := atomic.AddUint64(&bp.current, 1)
+
+	// Search up to n times to find the first healthy backend starting from our round-robin index.
+	for i := uint64(0); i < n; i++ {
+		idx := (next + i) % n
+		candidate := bp.backends[idx]
+		if candidate.IsAlive() {
+			return candidate
+		}
+	}
+
+	return nil
+}
+
+================================================================================
+  FILE: backend/backend.go
+  ROLE: Simulated downstream HTTP backend servers for local testing.
+  STRUCTS: SimulatedBackend
+  ENDPOINTS: / (main handler), /health (health check), /toggle (simulate failure)
+  CONCURRENCY: sync.RWMutex on SimulatedBackend.healthy
+================================================================================
+
+package backend
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+)
+
+// SimulatedBackend simulates a downstream backend server with dynamic health toggling.
+type SimulatedBackend struct {
+	Addr    string
+	healthy bool
+	mu      sync.RWMutex
+	server  *http.Server
+}
+
+// NewSimulatedBackend creates a new backend instance.
+func NewSimulatedBackend(addr string) *SimulatedBackend {
+	return &SimulatedBackend{
+		Addr:    addr,
+		healthy: true,
+	}
+}
+
+// Start runs the HTTP server in a blocking call. It should be executed in a goroutine.
+func (sb *SimulatedBackend) Start() error {
+	mux := http.NewServeMux()
+
+	// Main request routing
+	mux.HandleFunc("/", sb.handleRequest)
+	// Health endpoint queried by the Gateway Health Checker
+	mux.HandleFunc("/health", sb.handleHealth)
+	// Endpoint to manually simulate failure/recovery for interview demos
+	mux.HandleFunc("/toggle", sb.handleToggle)
+
+	sb.server = &http.Server{
+		Addr:    sb.Addr,
+		Handler: mux,
+	}
+
+	log.Printf("[Backend %s] Starting simulated backend...", sb.Addr)
+	return sb.server.ListenAndServe()
+}
+
+// Close stops the HTTP server.
+func (sb *SimulatedBackend) Close() error {
+	if sb.server != nil {
+		return sb.server.Close()
+	}
+	return nil
+}
+
+// handleRequest processes incoming proxied HTTP traffic.
+func (sb *SimulatedBackend) handleRequest(w http.ResponseWriter, r *http.Request) {
+	sb.mu.RLock()
+	isHealthy := sb.healthy
+	sb.mu.RUnlock()
+
+	if !isHealthy {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Backend %s is UNHEALTHY (Simulated Failure)\n", sb.Addr)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Hello from backend server running at %s! Request Path: %s\n", sb.Addr, r.URL.Path)
+}
+
+// handleHealth reports health status to the health checker.
+func (sb *SimulatedBackend) handleHealth(w http.ResponseWriter, r *http.Request) {
+	sb.mu.RLock()
+	isHealthy := sb.healthy
+	sb.mu.RUnlock()
+
+	if isHealthy {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+	} else {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "FAIL")
+	}
+}
+
+// handleToggle allows manual simulation of failures via curl/browser.
+func (sb *SimulatedBackend) handleToggle(w http.ResponseWriter, r *http.Request) {
+	sb.mu.Lock()
+	sb.healthy = !sb.healthy
+	currentStatus := sb.healthy
+	sb.mu.Unlock()
+
+	statusStr := "HEALTHY"
+	if !currentStatus {
+		statusStr = "UNHEALTHY"
+	}
+
+	log.Printf("[Backend %s] Health manually toggled to: %s", sb.Addr, statusStr)
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Backend %s status toggled to %s\n", sb.Addr, statusStr)
+}
+
+================================================================================
+  FILE: proxy/proxy.go
+  ROLE: Wraps httputil.ReverseProxy with custom transport, headers, error handler.
+  STRUCTS: GatewayHandler
+  FUNCTIONS: NewProxy (creates configured reverse proxy), NewGatewayHandler
+  INTERFACE: GatewayHandler implements http.Handler (ServeHTTP)
+  CONCURRENCY: Passive failure callback closes over *Backend pointer
+================================================================================
+
+package proxy
+
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"time"
+
+	"letsgolang/loadbalancer"
+)
+
+// NewProxy creates a configured ReverseProxy instance for a specific backend URL.
+// It uses a custom transport to set timeouts and an ErrorHandler to trigger passive failure detection.
+func NewProxy(target *url.URL, timeout time.Duration, onFailure func(error)) *httputil.ReverseProxy {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	// Configure a dedicated Transport layer with timeouts to manage connection pooling.
+	proxy.Transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   timeout,         // Time limit to establish a TCP connection
+			KeepAlive: 30 * time.Second, // Keep-alive probe interval
+		}).DialContext,
+		MaxIdleConns:          100,               // Max idle connections across all hosts
+		IdleConnTimeout:       90 * time.Second,  // Keep idle connections open for 90s
+		TLSHandshakeTimeout:   10 * time.Second,  // Max time allowed for TLS handshakes
+		ExpectContinueTimeout: 1 * time.Second,   // Wait time for 100-continue header response
+	}
+
+	// Customize the Request Director to modify request headers before forwarding.
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+
+		// 1. Set X-Forwarded-Host to preserve client's original HTTP Host header
+		if req.Header.Get("X-Forwarded-Host") == "" {
+			req.Header.Set("X-Forwarded-Host", req.Host)
+		}
+
+		// 2. Set X-Forwarded-Proto to track original client protocol schema (HTTP or HTTPS)
+		if req.TLS != nil {
+			req.Header.Set("X-Forwarded-Proto", "https")
+		} else {
+			req.Header.Set("X-Forwarded-Proto", "http")
+		}
+	}
+
+	// Define a custom ErrorHandler. If the proxy fails to reach the backend,
+	// it triggers passive failure detection, marking the backend offline immediately.
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("[Proxy] Error routing request to %s: %v. Marking backend offline.", target.String(), err)
+		onFailure(err)
+
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, "Bad Gateway: Failed to connect to downstream backend server.\n")
+	}
+
+	return proxy
+}
+
+// GatewayHandler coordinates incoming client traffic to the appropriate backend using the load balancer.
+type GatewayHandler struct {
+	Pool *loadbalancer.BackendPool
+}
+
+// NewGatewayHandler creates a new reverse proxy gateway routing handler.
+func NewGatewayHandler(pool *loadbalancer.BackendPool) *GatewayHandler {
+	return &GatewayHandler{
+		Pool: pool,
+	}
+}
+
+// ServeHTTP implements the http.Handler interface to route requests.
+func (gh *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Exclude favicon requests from logging and proxying
+	if r.URL.Path == "/favicon.ico" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// 1. Select the next healthy backend from the pool
+	targetBackend := gh.Pool.NextBackend()
+	if targetBackend == nil {
+		log.Printf("[Gateway] Request FAILED: No healthy backends available in the pool for path %q", r.URL.Path)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, "Service Unavailable: No healthy backend servers are currently active in the pool.\n")
+		return
+	}
+
+	log.Printf("[Gateway] Routing client %s -> backend %s (%s)", r.RemoteAddr, targetBackend.URL.Host, r.URL.Path)
+
+	// 2. Delegate execution to the backend's ReverseProxy handler
+	targetBackend.ReverseProxy.ServeHTTP(w, r)
+}
+
+================================================================================
+  FILE: health/checker.go
+  ROLE: Active background health checker — polls /health on each backend.
+  STRUCTS: HealthChecker
+  CONCURRENCY: Background goroutine with time.Ticker, parallel sub-goroutines
+               for pinging each backend, sync.WaitGroup for coordination,
+               stopChan for graceful termination.
+================================================================================
+
+package health
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"letsgolang/loadbalancer"
+)
+
+// HealthChecker handles active background polling of downstream backends.
+type HealthChecker struct {
+	pool      *loadbalancer.BackendPool
+	interval  time.Duration
+	timeout   time.Duration
+	client    *http.Client
+	stopChan  chan struct{}
+	wg        sync.WaitGroup
+	runningMu sync.Mutex
+	running   bool
+}
+
+// NewHealthChecker creates a new HealthChecker.
+func NewHealthChecker(pool *loadbalancer.BackendPool, interval, timeout time.Duration) *HealthChecker {
+	return &HealthChecker{
+		pool:     pool,
+		interval: interval,
+		timeout:  timeout,
+		client: &http.Client{
+			Timeout: timeout,
+		},
+		stopChan: make(chan struct{}),
+	}
+}
+
+// Start spawns the background polling loop.
+func (hc *HealthChecker) Start() {
+	hc.runningMu.Lock()
+	if hc.running {
+		hc.runningMu.Unlock()
+		return
+	}
+	hc.running = true
+	hc.runningMu.Unlock()
+
+	hc.wg.Add(1)
+	go func() {
+		defer hc.wg.Done()
+		ticker := time.NewTicker(hc.interval)
+		defer ticker.Stop()
+
+		// Run an initial health check immediately on startup
+		hc.checkAll()
+
+		for {
+			select {
+			case <-ticker.C:
+				hc.checkAll()
+			case <-hc.stopChan:
+				log.Println("[HealthChecker] Stopping active background checks...")
+				return
+			}
+		}
+	}()
+}
+
+// Stop gracefully shuts down the health checking ticker and waits for any active queries to exit.
+func (hc *HealthChecker) Stop() {
+	hc.runningMu.Lock()
+	if !hc.running {
+		hc.runningMu.Unlock()
+		return
+	}
+	hc.running = false
+	close(hc.stopChan)
+	hc.runningMu.Unlock()
+
+	hc.wg.Wait()
+	log.Println("[HealthChecker] Stopped successfully.")
+}
+
+// checkAll queries every backend registered in the pool concurrently.
+func (hc *HealthChecker) checkAll() {
+	backends := hc.pool.GetBackends()
+	var checkWg sync.WaitGroup
+
+	for _, b := range backends {
+		checkWg.Add(1)
+		go func(backend *loadbalancer.Backend) {
+			defer checkWg.Done()
+			hc.checkBackend(backend)
+		}(b)
+	}
+
+	checkWg.Wait()
+}
+
+// checkBackend sends an HTTP health request to a specific backend's health endpoint.
+func (hc *HealthChecker) checkBackend(b *loadbalancer.Backend) {
+	healthURL := *b.URL
+	healthURL.Path = "/health"
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET", healthURL.String(), nil)
+	if err != nil {
+		log.Printf("[HealthChecker] Failed to create request for %s: %v", b.URL.Host, err)
+		b.SetAlive(false)
+		return
+	}
+
+	resp, err := hc.client.Do(req)
+	if err != nil {
+		// Log the transition from alive to dead to avoid log spam, but here we can just log failures
+		wasAlive := b.IsAlive()
+		b.SetAlive(false)
+		if wasAlive {
+			log.Printf("[HealthChecker] Backend %s went OFFLINE (Error: %v)", b.URL.Host, err)
+		}
+		return
+	}
+	defer resp.Body.Close()
+
+	isHealthy := resp.StatusCode == http.StatusOK
+	wasAlive := b.IsAlive()
+	b.SetAlive(isHealthy)
+
+	if isHealthy && !wasAlive {
+		log.Printf("[HealthChecker] Backend %s went ONLINE (Successfully recovered)", b.URL.Host)
+	} else if !isHealthy && wasAlive {
+		log.Printf("[HealthChecker] Backend %s went OFFLINE (HTTP status: %d)", b.URL.Host, resp.StatusCode)
+	}
+}
+
+================================================================================
+  FILE: server/server.go
+  ROLE: HTTP listener socket lifecycle and graceful shutdown orchestration.
+  STRUCTS: GatewayServer
+  CONCURRENCY: Goroutine for ListenAndServe, signal channel for OS interrupts,
+               context.WithTimeout for bounded shutdown draining.
+================================================================================
+
+package server
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"letsgolang/health"
+)
+
+// GatewayServer manages the lifecycle of the load-balanced reverse proxy gateway.
+type GatewayServer struct {
+	httpServer      *http.Server
+	checker         *health.HealthChecker
+	shutdownTimeout time.Duration
+}
+
+// NewGatewayServer initializes a new gateway server instance.
+func NewGatewayServer(addr string, handler http.Handler, checker *health.HealthChecker, shutdownTimeout time.Duration) *GatewayServer {
+	return &GatewayServer{
+		httpServer: &http.Server{
+			Addr:    addr,
+			Handler: handler,
+		},
+		checker:         checker,
+		shutdownTimeout: shutdownTimeout,
+	}
+}
+
+// Start launches the server, starts health checks, and blocks waiting for OS signals to shutdown gracefully.
+func (gs *GatewayServer) Start() error {
+	// 1. Start the active background health checker
+	gs.checker.Start()
+
+	// 2. Setup channel to receive HTTP server execution errors (e.g., port already bound)
+	serverErrors := make(chan error, 1)
+
+	// 3. Start listening for incoming client connections concurrently
+	go func() {
+		log.Printf("[GatewayServer] Gateway listening on %s", gs.httpServer.Addr)
+		if err := gs.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrors <- err
+		}
+	}()
+
+	// 4. Register signal handler channel for OS termination signals (SIGINT, SIGTERM)
+	shutdownSignal := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignal, os.Interrupt, syscall.SIGTERM)
+
+	// 5. Block until either the server crashes or we receive an interrupt signal
+	select {
+	case err := <-serverErrors:
+		return err
+	case sig := <-shutdownSignal:
+		log.Printf("[GatewayServer] Shutdown signal (%v) received. Initiating graceful shutdown...", sig)
+
+		// Create a bounded context to enforce a maximum wait time for active connection draining
+		ctx, cancel := context.WithTimeout(context.Background(), gs.shutdownTimeout)
+		defer cancel()
+
+		// Stop the background health checking ticker to prevent goroutine leaks
+		gs.checker.Stop()
+
+		// Gracefully drain all active HTTP requests. New requests will be rejected immediately,
+		// but existing client connections are given until the context expires to complete.
+		if err := gs.httpServer.Shutdown(ctx); err != nil {
+			log.Printf("[GatewayServer] Graceful shutdown failed: %v. Forcing immediate close.", err)
+			_ = gs.httpServer.Close()
+			return err
+		}
+
+		log.Println("[GatewayServer] Server stopped gracefully.")
+		return nil
+	}
+}
+
+================================================================================
+  FILE: main.go
+  ROLE: Entry point. Bootstraps backends, pool, proxies, health checker, server.
+  GOROUTINES SPAWNED: One per simulated backend server.
+  KEY PATTERN: Closure-based passive failure detection (line 61-66).
+================================================================================
+
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+	"time"
+
+	"letsgolang/backend"
+	"letsgolang/config"
+	"letsgolang/health"
+	"letsgolang/loadbalancer"
+	"letsgolang/proxy"
+	"letsgolang/server"
+)
+
+func main() {
+	log.Println("[Main] Initializing Gateway and Backends...")
+
+	// 1. Load configuration from flags
+	cfg := config.LoadConfig()
+
+	// 2. Start simulated backends in concurrent goroutines
+	var simulatedServers []*backend.SimulatedBackend
+	for _, addr := range cfg.BackendAddrs {
+		sb := backend.NewSimulatedBackend(addr)
+		simulatedServers = append(simulatedServers, sb)
+
+		// Start backend in a background goroutine
+		go func(srv *backend.SimulatedBackend) {
+			if err := srv.Start(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("[Main] Simulated backend at %s failed: %v", srv.Addr, err)
+			}
+		}(sb)
+	}
+
+	// Defer cleanup of simulated backends when main exits
+	defer func() {
+		log.Println("[Main] Cleaning up simulated backends...")
+		for _, srv := range simulatedServers {
+			_ = srv.Close()
+		}
+	}()
+
+	// Give simulated backends a brief moment to start up before checking health
+	time.Sleep(500 * time.Millisecond)
+
+	// 3. Initialize Backend Pool
+	pool := loadbalancer.NewBackendPool()
+	for _, addr := range cfg.BackendAddrs {
+		backendURL, err := url.Parse(fmt.Sprintf("http://%s", addr))
+		if err != nil {
+			log.Fatalf("[Main] Invalid backend URL %s: %v", addr, err)
+		}
+
+		// Closure-based passive failure detection:
+		// We define the Backend pointer first so the error handler can close over it.
+		var b *loadbalancer.Backend
+
+		proxyHandler := proxy.NewProxy(backendURL, cfg.ProxyTimeout, func(err error) {
+			if b != nil {
+				// Mark backend offline immediately upon request routing failure
+				b.SetAlive(false)
+			}
+		})
+
+		b = &loadbalancer.Backend{
+			URL:          backendURL,
+			Alive:        true, // Start by assuming healthy; health checker will verify
+			ReverseProxy: proxyHandler,
+		}
+
+		pool.AddBackend(b)
+	}
+
+	// 4. Create active background Health Checker
+	checker := health.NewHealthChecker(pool, cfg.HealthCheckInterval, cfg.HealthCheckTimeout)
+
+	// 5. Create reverse proxy Gateway HTTP Handler
+	gatewayHandler := proxy.NewGatewayHandler(pool)
+
+	// 6. Create and start Orchestrator Server
+	srv := server.NewGatewayServer(cfg.GatewayAddr, gatewayHandler, checker, 10*time.Second)
+
+	log.Printf("[Main] System initialized. Routing to: %v", cfg.BackendAddrs)
+	if err := srv.Start(); err != nil {
+		log.Fatalf("[Main] Gateway encountered critical error: %v", err)
+	}
+}
+
+================================================================================
+  FILE: tests/roundrobin_test.go
+  ROLE: Unit tests for selection distribution, unhealthy exclusion, concurrency.
+  RUN:  go test -v ./tests/ -run TestRoundRobin
+  RACE: go test -race ./tests/   (requires CGO_ENABLED=1)
+================================================================================
+
+package tests
+
+import (
+	"net/url"
+	"sync"
+	"testing"
+
+	"letsgolang/loadbalancer"
+)
+
+func TestRoundRobinSelection(t *testing.T) {
+	pool := loadbalancer.NewBackendPool()
+
+	urlA, _ := url.Parse("http://127.0.0.1:8081")
+	urlB, _ := url.Parse("http://127.0.0.1:8082")
+	urlC, _ := url.Parse("http://127.0.0.1:8083")
+
+	bA := &loadbalancer.Backend{URL: urlA, Alive: true}
+	bB := &loadbalancer.Backend{URL: urlB, Alive: true}
+	bC := &loadbalancer.Backend{URL: urlC, Alive: true}
+
+	pool.AddBackend(bA)
+	pool.AddBackend(bB)
+	pool.AddBackend(bC)
+
+	// Since current index is initialized to 0, atomic.AddUint64 sets it to 1.
+	// 1 % 3 = 1 -> bB
+	// 2 % 3 = 2 -> bC
+	// 3 % 3 = 0 -> bA
+	// Let's verify that successive calls return all three in order.
+	seen := make(map[string]int)
+	for i := 0; i < 6; i++ {
+		b := pool.NextBackend()
+		if b == nil {
+			t.Fatal("Expected backend, got nil")
+		}
+		seen[b.URL.Host]++
+	}
+
+	if seen["127.0.0.1:8081"] != 2 || seen["127.0.0.1:8082"] != 2 || seen["127.0.0.1:8083"] != 2 {
+		t.Errorf("Round Robin distribution incorrect. Seen map: %v", seen)
+	}
+}
+
+func TestUnhealthyBackendExclusion(t *testing.T) {
+	pool := loadbalancer.NewBackendPool()
+
+	urlA, _ := url.Parse("http://127.0.0.1:8081")
+	urlB, _ := url.Parse("http://127.0.0.1:8082")
+
+	bA := &loadbalancer.Backend{URL: urlA, Alive: true}
+	bB := &loadbalancer.Backend{URL: urlB, Alive: false} // Backend B is dead
+
+	pool.AddBackend(bA)
+	pool.AddBackend(bB)
+
+	// NextBackend should only return Backend A since B is dead
+	for i := 0; i < 5; i++ {
+		b := pool.NextBackend()
+		if b == nil {
+			t.Fatal("Expected active backend A, got nil")
+		}
+		if b.URL.Host != "127.0.0.1:8081" {
+			t.Errorf("Expected backend A, but got %s", b.URL.Host)
+		}
+	}
+
+	// Make Backend B alive and Backend A dead
+	bB.SetAlive(true)
+	bA.SetAlive(false)
+
+	// NextBackend should now only return Backend B
+	for i := 0; i < 5; i++ {
+		b := pool.NextBackend()
+		if b == nil {
+			t.Fatal("Expected active backend B, got nil")
+		}
+		if b.URL.Host != "127.0.0.1:8082" {
+			t.Errorf("Expected backend B, but got %s", b.URL.Host)
+		}
+	}
+
+	// Mark both dead
+	bB.SetAlive(false)
+	b := pool.NextBackend()
+	if b != nil {
+		t.Errorf("Expected nil when all backends are dead, got %s", b.URL.Host)
+	}
+}
+
+func TestConcurrentBackendSelection(t *testing.T) {
+	pool := loadbalancer.NewBackendPool()
+
+	urlA, _ := url.Parse("http://127.0.0.1:8081")
+	urlB, _ := url.Parse("http://127.0.0.1:8082")
+
+	bA := &loadbalancer.Backend{URL: urlA, Alive: true}
+	bB := &loadbalancer.Backend{URL: urlB, Alive: true}
+
+	pool.AddBackend(bA)
+	pool.AddBackend(bB)
+
+	var wg sync.WaitGroup
+	workers := 50
+	iterations := 1000
+
+	// Launch multiple goroutines selecting backends simultaneously to verify lack of races
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				b := pool.NextBackend()
+				if b == nil {
+					t.Error("Expected healthy backend, got nil")
+					return
+				}
+				// Simulate read access
+				_ = b.IsAlive()
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+================================================================================
+  FILE: tests/proxy_test.go
+  ROLE: Tests proxy header rewriting and passive failure callback triggering.
+  RUN:  go test -v ./tests/ -run TestProxy
+================================================================================
+
+package tests
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"letsgolang/proxy"
+)
+
+func TestProxyForwardingAndHeaders(t *testing.T) {
+	var receivedHeaders http.Header
+
+	// 1. Create a simulated backend server using httptest
+	backendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend success"))
+	}))
+	defer backendSrv.Close()
+
+	backendURL, err := url.Parse(backendSrv.URL)
+	if err != nil {
+		t.Fatalf("Failed to parse backend URL: %v", err)
+	}
+
+	// 2. Initialize our proxy handler pointing to this backend
+	var failedCount int64
+	proxyHandler := proxy.NewProxy(backendURL, 2*time.Second, func(err error) {
+		atomic.AddInt64(&failedCount, 1)
+	})
+
+	// 3. Create a test client request hitting our proxy handler
+	req := httptest.NewRequest("GET", "http://gateway.local/some-path", nil)
+	req.RemoteAddr = "192.168.1.100:54321"
+	req.Host = "gateway.local"
+
+	rec := httptest.NewRecorder()
+
+	// 4. Run the proxy handler
+	proxyHandler.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// 5. Verify the response and headers modified by proxy
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	if string(body) != "backend success" {
+		t.Errorf("Expected response body 'backend success', got %q", string(body))
+	}
+
+	// Check forwarded headers
+	forwardedFor := receivedHeaders.Get("X-Forwarded-For")
+	if forwardedFor != "192.168.1.100" {
+		t.Errorf("Expected X-Forwarded-For to be '192.168.1.100', got %q", forwardedFor)
+	}
+
+	forwardedHost := receivedHeaders.Get("X-Forwarded-Host")
+	if forwardedHost != "gateway.local" {
+		t.Errorf("Expected X-Forwarded-Host to be 'gateway.local', got %q", forwardedHost)
+	}
+
+	forwardedProto := receivedHeaders.Get("X-Forwarded-Proto")
+	if forwardedProto != "http" {
+		t.Errorf("Expected X-Forwarded-Proto to be 'http', got %q", forwardedProto)
+	}
+
+	if atomic.LoadInt64(&failedCount) != 0 {
+		t.Error("Failure callback was triggered unexpectedly")
+	}
+}
+
+func TestProxyPassiveFailureTrigger(t *testing.T) {
+	// 1. Create a simulated backend and close it immediately to force connection failure
+	backendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	backendURL, _ := url.Parse(backendSrv.URL)
+	backendSrv.Close() // Backend is offline now
+
+	// 2. Set up our proxy with a passive failure callback
+	var failedCount int64
+	proxyHandler := proxy.NewProxy(backendURL, 100*time.Millisecond, func(err error) {
+		atomic.AddInt64(&failedCount, 1)
+	})
+
+	// 3. Issue a request through proxy handler
+	req := httptest.NewRequest("GET", "http://gateway.local/path", nil)
+	rec := httptest.NewRecorder()
+	proxyHandler.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	// 4. Verify that we got a 502 Bad Gateway and the failure callback triggered
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("Expected status 502 Bad Gateway, got %d", resp.StatusCode)
+	}
+
+	if atomic.LoadInt64(&failedCount) != 1 {
+		t.Errorf("Expected failure callback count to be 1, got %d", atomic.LoadInt64(&failedCount))
+	}
+}
+
+================================================================================
+  FILE: tests/integration_test.go
+  ROLE: End-to-end test — round-robin routing, failover, and recovery.
+  RUN:  go test -v ./tests/ -run TestGatewayIntegration
+================================================================================
+
+package tests
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+	"time"
+
+	"letsgolang/loadbalancer"
+	"letsgolang/proxy"
+)
+
+func TestGatewayIntegration(t *testing.T) {
+	// 1. Start two test backend servers with distinct IDs
+	backendASrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-A"))
+	}))
+	defer backendASrv.Close()
+
+	backendBSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-B"))
+	}))
+	defer backendBSrv.Close()
+
+	urlA, _ := url.Parse(backendASrv.URL)
+	urlB, _ := url.Parse(backendBSrv.URL)
+
+	// 2. Initialize Backend Pool and proxies
+	pool := loadbalancer.NewBackendPool()
+
+	var bA, bB *loadbalancer.Backend
+
+	proxyA := proxy.NewProxy(urlA, time.Second, func(err error) {
+		if bA != nil {
+			bA.SetAlive(false)
+		}
+	})
+
+	proxyB := proxy.NewProxy(urlB, time.Second, func(err error) {
+		if bB != nil {
+			bB.SetAlive(false)
+		}
+	})
+
+	bA = &loadbalancer.Backend{URL: urlA, Alive: true, ReverseProxy: proxyA}
+	bB = &loadbalancer.Backend{URL: urlB, Alive: true, ReverseProxy: proxyB}
+
+	pool.AddBackend(bA)
+	pool.AddBackend(bB)
+
+	// 3. Setup Gateway Handler
+	gatewayHandler := proxy.NewGatewayHandler(pool)
+
+	// Helper function to query the gateway
+	queryGateway := func() string {
+		req := httptest.NewRequest("GET", "http://gateway.local/", nil)
+		rec := httptest.NewRecorder()
+		gatewayHandler.ServeHTTP(rec, req)
+		resp := rec.Result()
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return string(body)
+	}
+
+	// 4. Test normal round-robin (distribution among A and B)
+	// Since current starts at 0, atomic.Add sets it to 1 -> index 1 -> Backend B
+	// Next is index 2 -> 0 -> Backend A
+	firstResp := queryGateway()
+	secondResp := queryGateway()
+
+	if firstResp == secondResp {
+		t.Errorf("Expected different responses from successive requests, but got both %q", firstResp)
+	}
+
+	// Ensure both are represented
+	resps := map[string]bool{firstResp: true, secondResp: true}
+	if !resps["backend-A"] || !resps["backend-B"] {
+		t.Errorf("Expected to hit both backend-A and backend-B, but got: %v", resps)
+	}
+
+	// 5. Simulate Backend A going offline
+	bA.SetAlive(false)
+
+	// Query gateway 4 times; all responses must go to Backend B now
+	for i := 0; i < 4; i++ {
+		resp := queryGateway()
+		if resp != "backend-B" {
+			t.Errorf("Expected only backend-B while backend-A is dead, but got %q", resp)
+		}
+	}
+
+	// 6. Simulate Backend A recovery
+	bA.SetAlive(true)
+
+	// Query gateway 4 times; traffic should distribute between A and B again
+	responses := make(map[string]int)
+	for i := 0; i < 10; i++ {
+		responses[queryGateway()]++
+	}
+
+	if responses["backend-A"] == 0 || responses["backend-B"] == 0 {
+		t.Errorf("Expected traffic to resume routing to both after recovery, got distributions: %v", responses)
+	}
+}
+
+================================================================================
+  END OF PROJECT INGEST
+  Total source files: 10
+  Total lines of Go code: ~860 (excluding tests: ~550)
+  External dependencies: 0
+================================================================================
