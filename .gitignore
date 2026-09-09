@@ -6,3 +6,7 @@ notes1.txt
 auto_pusher.log
 auto_pusher.ps1
 *.exe
+HindDoc/
+docs/
+INTextraPREP/
+upgrades/
