@@ -61,7 +61,7 @@ func main() {
 
 		proxyHandler := proxy.NewProxy(backendURL, cfg.ProxyTimeout, func(err error) {
 			if b != nil {
-				// Mark backend offline immediately upon request routing failure
+				// 502 ERROR : Mark backend offline immediately upon request routing failure
 				b.SetAlive(false)
 			}
 		})
